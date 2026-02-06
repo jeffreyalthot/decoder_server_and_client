@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <iostream>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -76,22 +77,92 @@ std::vector<unsigned char> aes256CbcDecrypt(const std::vector<unsigned char> &ci
     plaintext.resize(static_cast<size_t>(outLen1 + outLen2));
     return plaintext;
 }
+
+std::string readAllStdin() {
+    std::string data;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        data.append(line);
+        data.push_back('\n');
+    }
+    return data;
+}
+
+std::string findBase64Token(const std::string &text) {
+    std::regex base64Pattern(R"(([A-Za-z0-9+/]{20,}={0,2}))");
+    std::smatch match;
+    std::string::const_iterator searchStart(text.cbegin());
+    std::string best;
+    while (std::regex_search(searchStart, text.cend(), match, base64Pattern)) {
+        if (match[1].length() > best.length()) {
+            best = match[1];
+        }
+        searchStart = match.suffix().first;
+    }
+    return best;
+}
+
+int findSpinCount(const std::string &text, int fallback) {
+    std::regex spinPattern(R"(Spin count[^0-9]*([0-9]+))", std::regex::icase);
+    std::smatch match;
+    if (std::regex_search(text, match, spinPattern)) {
+        return std::stoi(match[1]);
+    }
+    return fallback;
+}
+
+std::vector<unsigned char> findHexValue(const std::string &text, const std::string &label) {
+    std::regex pattern(label + R"([^0-9a-fA-F]*([0-9a-fA-F]{16,}))", std::regex::icase);
+    std::smatch match;
+    if (!std::regex_search(text, match, pattern)) {
+        return {};
+    }
+
+    const std::string hex = match[1];
+    if (hex.size() % 2 != 0) {
+        throw std::runtime_error("Hex string must have even length");
+    }
+    std::vector<unsigned char> out(hex.size() / 2);
+    for (size_t i = 0; i < out.size(); ++i) {
+        unsigned int byte = 0;
+        if (sscanf(hex.c_str() + (i * 2), "%2x", &byte) != 1) {
+            throw std::runtime_error("Invalid hex string");
+        }
+        out[i] = static_cast<unsigned char>(byte);
+    }
+    return out;
+}
+
+bool findSizes(const std::string &text, size_t &saltSize, size_t &ivSize) {
+    std::regex sizePattern(R"(Sz:\s*([0-9]+)[_x]([0-9]+))", std::regex::icase);
+    std::smatch match;
+    if (!std::regex_search(text, match, sizePattern)) {
+        return false;
+    }
+    saltSize = static_cast<size_t>(std::stoul(match[1]));
+    ivSize = static_cast<size_t>(std::stoul(match[2]));
+    return true;
+}
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5) {
-        std::cerr << "Usage: " << argv[0]
+    if (argc < 2) {
+        std::cerr << "Usage:\n";
+        std::cerr << "  " << argv[0]
                   << " <base64_blob> <password> <salt_hex> <iv_hex> [iterations]\n";
-        std::cerr << "Example: " << argv[0]
+        std::cerr << "  " << argv[0]
+                  << " <password> < input.txt\n";
+        std::cerr << "Example:\n  " << argv[0]
                   << " 'MJIgcw...' '2026-02-06' 00112233445566778899aabbccddeeff 0102030405060708090a0b0c0d0e0f10 82925\n";
         return 1;
     }
 
-    std::string base64Blob = argv[1];
-    std::string password = argv[2];
-    std::string saltHex = argv[3];
-    std::string ivHex = argv[4];
-    int iterations = (argc > 5) ? std::stoi(argv[5]) : 82925;
+    std::string base64Blob;
+    std::string password;
+    std::vector<unsigned char> salt;
+    std::vector<unsigned char> iv;
+    std::vector<unsigned char> ciphertext;
+    int iterations = 82925;
 
     auto hexToBytes = [](const std::string &hex) {
         if (hex.size() % 2 != 0) {
@@ -108,10 +179,50 @@ int main(int argc, char **argv) {
         return out;
     };
 
+    if (argc >= 5) {
+        base64Blob = argv[1];
+        password = argv[2];
+        salt = hexToBytes(argv[3]);
+        iv = hexToBytes(argv[4]);
+        iterations = (argc > 5) ? std::stoi(argv[5]) : iterations;
+    } else {
+        password = argv[1];
+        const std::string inputText = readAllStdin();
+        base64Blob = findBase64Token(inputText);
+        if (base64Blob.empty()) {
+            std::cerr << "Error: No base64 payload found in input.\n";
+            return 1;
+        }
+        iterations = findSpinCount(inputText, iterations);
+        salt = findHexValue(inputText, "salt");
+        iv = findHexValue(inputText, "iv");
+
+        if (salt.empty() || iv.empty()) {
+            size_t saltSize = 0;
+            size_t ivSize = 0;
+            if (findSizes(inputText, saltSize, ivSize)) {
+                std::vector<unsigned char> raw = base64Decode(base64Blob);
+                if (raw.size() < saltSize + ivSize) {
+                    std::cerr << "Error: Payload too small to split salt/iv by size.\n";
+                    return 1;
+                }
+                salt.assign(raw.begin(), raw.begin() + static_cast<long>(saltSize));
+                iv.assign(raw.begin() + static_cast<long>(saltSize),
+                          raw.begin() + static_cast<long>(saltSize + ivSize));
+                ciphertext.assign(raw.begin() + static_cast<long>(saltSize + ivSize), raw.end());
+            }
+        }
+
+        if (salt.empty() || iv.empty()) {
+            std::cerr << "Error: Salt/IV missing. Provide them as hex in input or use the explicit arguments.\n";
+            return 1;
+        }
+    }
+
     try {
-        std::vector<unsigned char> salt = hexToBytes(saltHex);
-        std::vector<unsigned char> iv = hexToBytes(ivHex);
-        std::vector<unsigned char> ciphertext = base64Decode(base64Blob);
+        if (ciphertext.empty()) {
+            ciphertext = base64Decode(base64Blob);
+        }
         std::vector<unsigned char> key = deriveKey(password, salt, iterations, 32);
 
         std::vector<unsigned char> plaintext = aes256CbcDecrypt(ciphertext, key, iv);
