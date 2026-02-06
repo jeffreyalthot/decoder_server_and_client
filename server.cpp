@@ -179,6 +179,15 @@ std::string timestampNow() {
     return oss.str();
 }
 
+bool sendWork(int fd, unsigned long long number) {
+    std::ostringstream response;
+    response << "{"
+             << "\"type\":\"work\","
+             << "\"number\":" << number
+             << "}";
+    return writeLine(fd, response.str());
+}
+
 struct ExtractedInfo {
     std::string base64;
     std::string saltHex;
@@ -278,6 +287,7 @@ int main(int argc, char **argv) {
     std::vector<StoredEntry> entries;
     const std::string storagePath = "server_storage.jsonl";
     int nextId = 1;
+    unsigned long long nextWorkNumber = 1;
 
     while (true) {
         sockaddr_in clientAddr{};
@@ -295,88 +305,116 @@ int main(int argc, char **argv) {
         }
 
         std::string type = jsonField(line, "type");
-        if (type != "submit") {
-            writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Expected submit\"}");
+        if (type == "submit") {
+            std::string payloadB64 = jsonField(line, "payload_b64");
+            if (payloadB64.empty()) {
+                writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Missing payload\"}");
+                close(clientFd);
+                continue;
+            }
+
+            std::string payload;
+            try {
+                std::vector<unsigned char> decoded = base64Decode(payloadB64);
+                payload.assign(decoded.begin(), decoded.end());
+            } catch (const std::exception &ex) {
+                writeLine(clientFd, std::string("{\"type\":\"error\",\"message\":\"") + jsonEscape(ex.what()) + "\"}");
+                close(clientFd);
+                continue;
+            }
+
+            ExtractedInfo info = extractInfo(payload);
+            if (info.base64.empty() || info.saltHex.empty() || info.ivHex.empty()) {
+                writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Missing base64/salt/iv\"}");
+                close(clientFd);
+                continue;
+            }
+
+            std::ostringstream response;
+            response << "{"
+                     << "\"type\":\"extracted\","
+                     << "\"base64\":\"" << jsonEscape(info.base64) << "\","
+                     << "\"salt_hex\":\"" << jsonEscape(info.saltHex) << "\","
+                     << "\"iv_hex\":\"" << jsonEscape(info.ivHex) << "\","
+                     << "\"iterations\":" << info.iterations
+                     << "}";
+            if (!writeLine(clientFd, response.str())) {
+                close(clientFd);
+                continue;
+            }
+
+            std::string finalizeLine = readLine(clientFd);
+            if (finalizeLine.empty()) {
+                close(clientFd);
+                continue;
+            }
+
+            std::string finalizeType = jsonField(finalizeLine, "type");
+            if (finalizeType != "finalize") {
+                writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Expected finalize\"}");
+                close(clientFd);
+                continue;
+            }
+
+            std::string email = jsonField(finalizeLine, "email");
+            std::string payloadB64Finalize = jsonField(finalizeLine, "payload_b64");
+            if (email.empty() || payloadB64Finalize.empty()) {
+                writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Missing email/payload\"}");
+                close(clientFd);
+                continue;
+            }
+
+            StoredEntry entry;
+            entry.id = nextId++;
+            entry.receivedAt = timestampNow();
+            entry.email = email;
+            entry.payload = payload;
+            entry.info = info;
+            entries.push_back(entry);
+
+            try {
+                appendToStorage(entry, storagePath);
+            } catch (const std::exception &ex) {
+                writeLine(clientFd, std::string("{\"type\":\"error\",\"message\":\"") + jsonEscape(ex.what()) + "\"}");
+                close(clientFd);
+                continue;
+            }
+
+            writeLine(clientFd, "{\"type\":\"stored\",\"message\":\"Entry saved\"}");
             close(clientFd);
-            continue;
-        }
+        } else if (type == "ping") {
+            if (!sendWork(clientFd, nextWorkNumber)) {
+                close(clientFd);
+                continue;
+            }
 
-        std::string payloadB64 = jsonField(line, "payload_b64");
-        if (payloadB64.empty()) {
-            writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Missing payload\"}");
+            while (true) {
+                std::string nextLine = readLine(clientFd);
+                if (nextLine.empty()) {
+                    break;
+                }
+                std::string nextType = jsonField(nextLine, "type");
+                if (nextType == "share") {
+                    nextWorkNumber += 1;
+                    if (!sendWork(clientFd, nextWorkNumber)) {
+                        break;
+                    }
+                    continue;
+                }
+                if (nextType == "ping") {
+                    if (!sendWork(clientFd, nextWorkNumber)) {
+                        break;
+                    }
+                    continue;
+                }
+                writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Unexpected message\"}");
+                break;
+            }
             close(clientFd);
-            continue;
-        }
-
-        std::string payload;
-        try {
-            std::vector<unsigned char> decoded = base64Decode(payloadB64);
-            payload.assign(decoded.begin(), decoded.end());
-        } catch (const std::exception &ex) {
-            writeLine(clientFd, std::string("{\"type\":\"error\",\"message\":\"") + jsonEscape(ex.what()) + "\"}");
+        } else {
+            writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Expected submit or ping\"}");
             close(clientFd);
-            continue;
         }
-
-        ExtractedInfo info = extractInfo(payload);
-        if (info.base64.empty() || info.saltHex.empty() || info.ivHex.empty()) {
-            writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Missing base64/salt/iv\"}");
-            close(clientFd);
-            continue;
-        }
-
-        std::ostringstream response;
-        response << "{"
-                 << "\"type\":\"extracted\","
-                 << "\"base64\":\"" << jsonEscape(info.base64) << "\","
-                 << "\"salt_hex\":\"" << jsonEscape(info.saltHex) << "\","
-                 << "\"iv_hex\":\"" << jsonEscape(info.ivHex) << "\","
-                 << "\"iterations\":" << info.iterations
-                 << "}";
-        if (!writeLine(clientFd, response.str())) {
-            close(clientFd);
-            continue;
-        }
-
-        std::string finalizeLine = readLine(clientFd);
-        if (finalizeLine.empty()) {
-            close(clientFd);
-            continue;
-        }
-
-        std::string finalizeType = jsonField(finalizeLine, "type");
-        if (finalizeType != "finalize") {
-            writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Expected finalize\"}");
-            close(clientFd);
-            continue;
-        }
-
-        std::string email = jsonField(finalizeLine, "email");
-        std::string payloadB64Finalize = jsonField(finalizeLine, "payload_b64");
-        if (email.empty() || payloadB64Finalize.empty()) {
-            writeLine(clientFd, "{\"type\":\"error\",\"message\":\"Missing email/payload\"}");
-            close(clientFd);
-            continue;
-        }
-
-        StoredEntry entry;
-        entry.id = nextId++;
-        entry.receivedAt = timestampNow();
-        entry.email = email;
-        entry.payload = payload;
-        entry.info = info;
-        entries.push_back(entry);
-
-        try {
-            appendToStorage(entry, storagePath);
-        } catch (const std::exception &ex) {
-            writeLine(clientFd, std::string("{\"type\":\"error\",\"message\":\"") + jsonEscape(ex.what()) + "\"}");
-            close(clientFd);
-            continue;
-        }
-
-        writeLine(clientFd, "{\"type\":\"stored\",\"message\":\"Entry saved\"}");
-        close(clientFd);
     }
 
     close(serverFd);
