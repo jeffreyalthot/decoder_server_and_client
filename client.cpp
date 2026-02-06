@@ -7,13 +7,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "counter_sink.h"
+
 #include <iostream>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <limits>
 
 namespace {
 std::string base64Encode(const std::string &input) {
@@ -114,6 +116,71 @@ std::string readMultilinePayload() {
     }
     return payload;
 }
+
+unsigned long long safePow(unsigned long long base, int exp) {
+    unsigned long long result = 1;
+    for (int i = 0; i < exp; ++i) {
+        if (result > std::numeric_limits<unsigned long long>::max() / base) {
+            return std::numeric_limits<unsigned long long>::max();
+        }
+        result *= base;
+    }
+    return result;
+}
+
+std::string counterValueForIndex(unsigned long long index,
+                                 const std::string &alphabet,
+                                 int maxLen) {
+    if (index == 0) {
+        return "";
+    }
+    const unsigned long long base = alphabet.size();
+    unsigned long long remaining = index;
+    for (int length = 1; length <= maxLen; ++length) {
+        unsigned long long count = safePow(base, length);
+        if (remaining > count) {
+            remaining -= count;
+            continue;
+        }
+
+        unsigned long long offset = remaining - 1;
+        std::string value(length, alphabet[0]);
+        for (int pos = length - 1; pos >= 0; --pos) {
+            unsigned long long digit = offset % base;
+            value[static_cast<size_t>(pos)] = alphabet[digit];
+            offset /= base;
+        }
+        return value;
+    }
+    return "";
+}
+
+bool processWorkRange(unsigned long long workNumber, int fd) {
+    const std::string alphabet =
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
+        "!@#$%^&*()_-+=";
+    const int maxLen = 12;
+    const unsigned long long range = 100000ULL;
+    unsigned long long startIndex = workNumber * range;
+
+    for (unsigned long long i = 0; i < range; ++i) {
+        unsigned long long index = startIndex + i;
+        std::string value = counterValueForIndex(index, alphabet, maxLen);
+        if (value.empty()) {
+            break;
+        }
+        handleCounterValue(value);
+    }
+
+    std::ostringstream share;
+    share << "{"
+          << "\"type\":\"share\","
+          << "\"number\":" << workNumber
+          << "}";
+    return writeLine(fd, share.str());
+}
 }
 
 int main(int argc, char **argv) {
@@ -128,29 +195,11 @@ int main(int argc, char **argv) {
 
     std::cout << "Client menu:\n";
     std::cout << "1) Send key set to server\n";
+    std::cout << "2) Start counter worker\n";
     std::cout << "Select option: ";
     int option = 0;
     std::cin >> option;
     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-
-    if (option != 1) {
-        std::cerr << "Only option 1 is supported.\n";
-        return 1;
-    }
-
-    std::string payload = readMultilinePayload();
-    if (payload.empty()) {
-        std::cerr << "No data provided.\n";
-        return 1;
-    }
-
-    std::string payloadB64;
-    try {
-        payloadB64 = base64Encode(payload);
-    } catch (const std::exception &ex) {
-        std::cerr << "Encoding failed: " << ex.what() << "\n";
-        return 1;
-    }
 
     int clientFd = socket(AF_INET, SOCK_STREAM, 0);
     if (clientFd < 0) {
@@ -169,6 +218,77 @@ int main(int argc, char **argv) {
 
     if (connect(clientFd, reinterpret_cast<sockaddr *>(&serverAddr), sizeof(serverAddr)) != 0) {
         std::cerr << "Failed to connect to server.\n";
+        close(clientFd);
+        return 1;
+    }
+
+    if (option == 2) {
+        if (!writeLine(clientFd, "{\"type\":\"ping\"}")) {
+            std::cerr << "Failed to send ping.\n";
+            close(clientFd);
+            return 1;
+        }
+
+        while (true) {
+            std::string workLine = readLine(clientFd);
+            if (workLine.empty()) {
+                std::cerr << "Connection closed by server.\n";
+                close(clientFd);
+                return 1;
+            }
+
+            std::string workType = jsonField(workLine, "type");
+            if (workType == "error") {
+                std::cerr << "Server error: " << jsonField(workLine, "message") << "\n";
+                close(clientFd);
+                return 1;
+            }
+            if (workType != "work") {
+                std::cerr << "Unexpected work response.\n";
+                close(clientFd);
+                return 1;
+            }
+
+            unsigned long long workNumber =
+                static_cast<unsigned long long>(jsonIntField(workLine, "number", 0));
+            if (workNumber == 0) {
+                std::cerr << "Invalid work number.\n";
+                close(clientFd);
+                return 1;
+            }
+
+            try {
+                if (!processWorkRange(workNumber, clientFd)) {
+                    std::cerr << "Failed to send share.\n";
+                    close(clientFd);
+                    return 1;
+                }
+            } catch (const std::exception &ex) {
+                std::cerr << "Counter processing failed: " << ex.what() << "\n";
+                close(clientFd);
+                return 1;
+            }
+        }
+    }
+
+    if (option != 1) {
+        std::cerr << "Only options 1 or 2 are supported.\n";
+        close(clientFd);
+        return 1;
+    }
+
+    std::string payload = readMultilinePayload();
+    if (payload.empty()) {
+        std::cerr << "No data provided.\n";
+        close(clientFd);
+        return 1;
+    }
+
+    std::string payloadB64;
+    try {
+        payloadB64 = base64Encode(payload);
+    } catch (const std::exception &ex) {
+        std::cerr << "Encoding failed: " << ex.what() << "\n";
         close(clientFd);
         return 1;
     }
